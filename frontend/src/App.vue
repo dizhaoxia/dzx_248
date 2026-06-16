@@ -13,6 +13,9 @@
           <router-link to="/documents" class="nav-link" active-class="active">
             📄 文档管理
           </router-link>
+          <router-link to="/synonyms" class="nav-link" active-class="active">
+            📚 同义词管理
+          </router-link>
         </div>
       </div>
     </nav>

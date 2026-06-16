@@ -7,12 +7,14 @@ from flask import Blueprint, request, jsonify, current_app
 from app.core.document_parser import DocumentParser
 from app.core.text_splitter import TextSplitter
 from app.core.index_manager import IndexManager
+from app.core.search_enhancer import SearchEnhancer
 
 api_bp = Blueprint('api', __name__)
 
 _doc_parser = None
 _text_splitter = None
 _index_manager = None
+_search_enhancer = None
 
 
 def get_doc_parser():
@@ -32,8 +34,17 @@ def get_text_splitter():
 def get_index_manager():
     global _index_manager
     if _index_manager is None:
-        _index_manager = IndexManager(current_app.config['INDEX_DIR'])
+        data_dir = os.path.join(os.path.dirname(current_app.config['INDEX_DIR']), 'data')
+        _index_manager = IndexManager(current_app.config['INDEX_DIR'], data_dir)
     return _index_manager
+
+
+def get_search_enhancer():
+    global _search_enhancer
+    if _search_enhancer is None:
+        data_dir = os.path.join(os.path.dirname(current_app.config['INDEX_DIR']), 'data')
+        _search_enhancer = SearchEnhancer(data_dir)
+    return _search_enhancer
 
 
 @api_bp.route('/health', methods=['GET'])
@@ -204,10 +215,12 @@ def search():
         if request.method == 'GET':
             query = request.args.get('q', '').strip()
             top_k = int(request.args.get('top_k', 3))
+            doc_id = request.args.get('doc_id', '').strip() or None
         else:
             data = request.get_json() or {}
             query = data.get('q', '').strip()
             top_k = int(data.get('top_k', 3))
+            doc_id = data.get('doc_id', '').strip() or None
 
         if not query:
             return jsonify({
@@ -218,7 +231,9 @@ def search():
         top_k = max(1, min(top_k, 20))
 
         index_mgr = get_index_manager()
-        results = index_mgr.search(query, top_k=top_k)
+        search_result = index_mgr.search(query, top_k=top_k, doc_id=doc_id)
+        
+        results = search_result['results']
 
         formatted_results = []
         for result in results:
@@ -228,14 +243,19 @@ def search():
                 'filename': result['filename'],
                 'section': result['section'],
                 'content': result['content'],
+                'focus_content': result['focus_content'],
                 'highlighted': result['highlighted'],
+                'highlighted_focus': result['highlighted_focus'],
                 'score': round(result['score'], 4),
+                'base_score': result['base_score'],
+                'phrase_boost': result['phrase_boost'],
                 'start_pos': result['start_pos'],
                 'end_pos': result['end_pos'],
                 'chunk_index': result['chunk_index'],
                 'total_chunks': result['total_chunks'],
                 'page': result['page'],
-                'matched_keywords': result['matched_keywords']
+                'matched_keywords': result['matched_keywords'],
+                'focus_matched_keywords': result['focus_matched_keywords']
             })
 
         return jsonify({
@@ -244,10 +264,240 @@ def search():
                 'query': query,
                 'total': len(formatted_results),
                 'top_k': top_k,
-                'results': formatted_results
+                'doc_id': doc_id,
+                'results': formatted_results,
+                'expanded_keywords': search_result['expanded_keywords'],
+                'phrases': search_result['phrases'],
+                'corrected_query': search_result['corrected_query'],
+                'spell_corrections': search_result['spell_corrections'],
+                'similar_queries': search_result['similar_queries']
             }
         })
 
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/synonyms', methods=['GET'])
+def get_synonyms():
+    try:
+        enhancer = get_search_enhancer()
+        synonyms = enhancer.get_all_synonyms()
+        return jsonify({
+            'success': True,
+            'data': synonyms
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/synonyms', methods=['POST'])
+def add_synonym():
+    try:
+        data = request.get_json() or {}
+        word = data.get('word', '').strip()
+        synonym = data.get('synonym', '').strip()
+
+        if not word or not synonym:
+            return jsonify({
+                'success': False,
+                'error': 'Both "word" and "synonym" are required'
+            }), 400
+
+        enhancer = get_search_enhancer()
+        enhancer.add_synonym(word, synonym)
+
+        return jsonify({
+            'success': True,
+            'message': f'Synonym added: {word} -> {synonym}'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/synonyms', methods=['DELETE'])
+def remove_synonym():
+    try:
+        data = request.get_json() or {}
+        word = data.get('word', '').strip()
+        synonym = data.get('synonym', '').strip()
+
+        if not word or not synonym:
+            return jsonify({
+                'success': False,
+                'error': 'Both "word" and "synonym" are required'
+            }), 400
+
+        enhancer = get_search_enhancer()
+        enhancer.remove_synonym(word, synonym)
+
+        return jsonify({
+            'success': True,
+            'message': f'Synonym removed: {word} -> {synonym}'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/synonyms/batch', methods=['POST'])
+def update_synonyms_batch():
+    try:
+        data = request.get_json() or {}
+        synonyms_dict = data.get('synonyms', {})
+
+        if not isinstance(synonyms_dict, dict):
+            return jsonify({
+                'success': False,
+                'error': 'synonyms must be a dictionary'
+            }), 400
+
+        enhancer = get_search_enhancer()
+        enhancer.update_synonyms_dict(synonyms_dict)
+
+        return jsonify({
+            'success': True,
+            'message': 'Synonyms dictionary updated successfully'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/spellcheck', methods=['GET', 'POST'])
+def spell_check():
+    try:
+        if request.method == 'GET':
+            query = request.args.get('q', '').strip()
+        else:
+            data = request.get_json() or {}
+            query = data.get('q', '').strip()
+
+        if not query:
+            return jsonify({
+                'success': False,
+                'error': 'Query parameter "q" is required'
+            }), 400
+
+        enhancer = get_search_enhancer()
+        corrected_query, corrections = enhancer.correct_spelling(query)
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'original_query': query,
+                'corrected_query': corrected_query,
+                'corrections': corrections
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/similar-queries', methods=['GET', 'POST'])
+def similar_queries():
+    try:
+        if request.method == 'GET':
+            query = request.args.get('q', '').strip()
+            top_k = int(request.args.get('top_k', 5))
+        else:
+            data = request.get_json() or {}
+            query = data.get('q', '').strip()
+            top_k = int(data.get('top_k', 5))
+
+        if not query:
+            return jsonify({
+                'success': False,
+                'error': 'Query parameter "q" is required'
+            }), 400
+
+        enhancer = get_search_enhancer()
+        similar = enhancer.find_similar_queries(query, top_k=top_k)
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'query': query,
+                'similar_queries': similar
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/query-history', methods=['GET'])
+def get_query_history():
+    try:
+        limit = int(request.args.get('limit', 50))
+        enhancer = get_search_enhancer()
+        history = enhancer.get_query_history(limit=limit)
+
+        return jsonify({
+            'success': True,
+            'data': history
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/query-history', methods=['DELETE'])
+def clear_query_history():
+    try:
+        enhancer = get_search_enhancer()
+        enhancer.clear_query_history()
+
+        return jsonify({
+            'success': True,
+            'message': 'Query history cleared'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@api_bp.route('/query-history/record', methods=['POST'])
+def record_query():
+    try:
+        data = request.get_json() or {}
+        query = data.get('q', '').strip()
+
+        if not query:
+            return jsonify({
+                'success': False,
+                'error': 'Query parameter "q" is required'
+            }), 400
+
+        enhancer = get_search_enhancer()
+        enhancer.record_query(query)
+
+        return jsonify({
+            'success': True,
+            'message': 'Query recorded'
+        })
     except Exception as e:
         return jsonify({
             'success': False,

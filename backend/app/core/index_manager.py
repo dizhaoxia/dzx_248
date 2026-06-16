@@ -2,21 +2,27 @@ import os
 import jieba
 import re
 import shutil
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 
 from whoosh.index import create_in, open_dir, exists_in
 from whoosh.fields import Schema, TEXT, ID, NUMERIC, DATETIME, STORED, KEYWORD
-from whoosh.query import Term, Or
+from whoosh.query import Term, Or, And
 from whoosh import scoring
 from whoosh.qparser import QueryParser
 
+from app.core.search_enhancer import SearchEnhancer
+
 
 class IndexManager:
-    def __init__(self, index_dir: str):
+    def __init__(self, index_dir: str, data_dir: str = None):
         self.index_dir = index_dir
         self.ix = None
         self._init_index()
+        
+        if data_dir is None:
+            data_dir = os.path.join(os.path.dirname(index_dir), 'data')
+        self.search_enhancer = SearchEnhancer(data_dir)
 
     def _init_index(self):
         os.makedirs(self.index_dir, exist_ok=True)
@@ -105,13 +111,35 @@ class IndexManager:
 
         return deleted_count
 
-    def search(self, query_str: str, top_k: int = 3) -> List[Dict]:
+    def search(self, query_str: str, top_k: int = 3, doc_id: str = None) -> Dict:
         if not query_str or not query_str.strip():
-            return []
+            return {
+                'results': [],
+                'expanded_keywords': [],
+                'phrases': [],
+                'corrected_query': None,
+                'spell_corrections': [],
+                'similar_queries': []
+            }
 
-        query_tokens = self._tokenize_query(query_str)
+        corrected_query, spell_corrections = self.search_enhancer.correct_spelling(query_str)
+        
+        search_query = corrected_query if corrected_query else query_str
+        
+        expanded_query, all_keywords = self.search_enhancer.expand_query_with_synonyms(search_query)
+        
+        phrases = self.search_enhancer.extract_phrases(search_query)
+        
+        query_tokens = self._tokenize_query(expanded_query)
         if not query_tokens:
-            return []
+            return {
+                'results': [],
+                'expanded_keywords': all_keywords,
+                'phrases': phrases,
+                'corrected_query': corrected_query,
+                'spell_corrections': spell_corrections,
+                'similar_queries': []
+            }
 
         results_list = []
 
@@ -122,31 +150,74 @@ class IndexManager:
                     terms.append(Term('content_index', token))
 
             if not terms:
-                return []
+                return {
+                    'results': [],
+                    'expanded_keywords': all_keywords,
+                    'phrases': phrases,
+                    'corrected_query': corrected_query,
+                    'spell_corrections': spell_corrections,
+                    'similar_queries': []
+                }
 
             query = Or(terms) if len(terms) > 1 else terms[0]
-            results = searcher.search(query, limit=top_k)
-
+            
+            if doc_id:
+                doc_filter = Term('doc_id', doc_id)
+                query = And([query, doc_filter])
+            
+            results = searcher.search(query, limit=top_k * 3)
+            
+            scored_results = []
             for hit in results:
-                highlighted = self._highlight_text(hit['content'], query_tokens)
-
-                results_list.append({
+                base_score = float(hit.score)
+                phrase_boost = self.search_enhancer.calculate_phrase_boost(hit['content'], phrases)
+                final_score = base_score * phrase_boost
+                
+                focus_content, focus_matched = self.search_enhancer.extract_focus_sentences(
+                    hit['content'], all_keywords, max_sentences=2
+                )
+                
+                all_matched = self._find_matched_keywords(all_keywords, hit['content'])
+                
+                highlighted_full = self._highlight_text(hit['content'], all_keywords)
+                highlighted_focus = self._highlight_text(focus_content, all_keywords)
+                
+                scored_results.append({
                     'doc_id': hit['doc_id'],
                     'chunk_id': hit['chunk_id'],
                     'filename': hit['filename'],
                     'section': hit.get('section', ''),
                     'content': hit['content'],
-                    'highlighted': highlighted,
-                    'score': float(hit.score),
+                    'focus_content': focus_content,
+                    'highlighted': highlighted_full,
+                    'highlighted_focus': highlighted_focus,
+                    'score': final_score,
+                    'base_score': round(base_score, 4),
+                    'phrase_boost': round(phrase_boost, 2),
                     'start_pos': hit['start_pos'],
                     'end_pos': hit['end_pos'],
                     'chunk_index': hit['chunk_index'],
                     'total_chunks': hit['total_chunks'],
                     'page': hit.get('page', 1),
-                    'matched_keywords': self._find_matched_keywords(query_tokens, hit['content'])
+                    'matched_keywords': all_matched,
+                    'focus_matched_keywords': focus_matched
                 })
+            
+            scored_results.sort(key=lambda x: x['score'], reverse=True)
+            results_list = scored_results[:top_k]
 
-        return results_list
+        similar_queries = self.search_enhancer.find_similar_queries(search_query, top_k=5)
+        
+        self.search_enhancer.record_query(query_str.strip())
+
+        return {
+            'results': results_list,
+            'expanded_keywords': all_keywords,
+            'phrases': phrases,
+            'corrected_query': corrected_query,
+            'spell_corrections': spell_corrections,
+            'similar_queries': similar_queries
+        }
 
     def _highlight_text(self, text: str, keywords: List[str]) -> str:
         if not keywords or not text:

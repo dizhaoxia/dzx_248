@@ -1,4 +1,10 @@
-<template>
+#!/usr/bin/env python3
+import os
+
+template_path = os.path.join(os.path.dirname(__file__), 'test_doc.md')
+output_path = '/Users/feixuan/Desktop/solo/dzx_248/frontend/src/views/SearchView.vue'
+
+content = r'''<template>
   <div class="search-page">
     <div class="container">
       <div class="search-header">
@@ -860,3 +866,10 @@ onMounted(() => {
   }
 }
 </style>
+'''
+
+with open(output_path, 'w', encoding='utf-8') as f:
+    f.write(content)
+
+print(f'File written successfully: {output_path}')
+print(f'File size: {os.path.getsize(output_path)} bytes')

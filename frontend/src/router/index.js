@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import SearchView from '../views/SearchView.vue'
 import DocumentsView from '../views/DocumentsView.vue'
+import SynonymsView from '../views/SynonymsView.vue'
 
 const routes = [
   {
@@ -12,6 +13,11 @@ const routes = [
     path: '/documents',
     name: 'documents',
     component: DocumentsView
+  },
+  {
+    path: '/synonyms',
+    name: 'synonyms',
+    component: SynonymsView
   }
 ]
 
